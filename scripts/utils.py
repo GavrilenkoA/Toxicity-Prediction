@@ -1,0 +1,196 @@
+import h5py
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
+from sklearn.utils import resample
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
+from rdkit import Chem, DataStructs
+from rdkit.Chem import rdFingerprintGenerator, rdMolDescriptors
+
+
+def load_embeddings_from_hdf5(file_path: str) -> dict:
+    embeddings = {}
+    with h5py.File(file_path, 'r') as h5f:
+        for smi_id in h5f.keys():
+            embeddings[smi_id] = h5f[smi_id][:]
+    return embeddings
+
+
+def remove_ambiguous_smiles(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove ambiguous SMILES from the DataFrame.
+
+    Parameters
+    ----------
+    dataframe : pd.DataFrame
+        DataFrame containing 'SMILES' and 'toxicity' columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with ambiguous SMILES removed and duplicates dropped.
+    """
+    duplicated_smiles = dataframe[dataframe.duplicated('SMILES', keep=False)]
+    smiles_counts = duplicated_smiles.groupby('SMILES')['toxicity'].nunique()
+    ambiguous_smiles = smiles_counts[smiles_counts > 1].index
+
+    dataframe = dataframe[~dataframe['SMILES'].isin(ambiguous_smiles)]
+    return dataframe.drop_duplicates(subset='SMILES')
+
+
+def form_data(df, train_idx, test_idx):
+    df_train = df.iloc[train_idx]
+    df_test = df.iloc[test_idx]
+    return df_train, df_test
+
+
+def compute_metrics(y_true, y_pred, y_proba):
+    metrics = {
+        'precision': precision_score(y_true, y_pred),
+        'recall': recall_score(y_true, y_pred),
+        'sensitivity': recall_score(y_true, y_pred, pos_label=0),
+        'f1': f1_score(y_true, y_pred),
+        'roc_auc': roc_auc_score(y_true, y_proba),
+    }
+    return metrics
+
+
+def balance_classes(df: pd.DataFrame, target_col: str, method: str = 'oversample') -> pd.DataFrame:
+    """
+    Балансирует классы в датафрейме.
+
+    Параметры:
+    - df: pd.DataFrame — входной датафрейм
+    - target_col: str — имя колонки с целевой переменной
+    - method: str — 'oversample' (по умолчанию) или 'undersample'
+
+    Возвращает:
+    - сбалансированный DataFrame
+    """
+    # Разделим по классам
+    classes = df[target_col].unique()
+    dfs = [df[df[target_col] == c] for c in classes]
+
+    if method == 'oversample':
+        max_len = max(len(subdf) for subdf in dfs)
+        balanced_dfs = [
+            resample(subdf, replace=True, n_samples=max_len, random_state=42)
+            for subdf in dfs
+        ]
+    elif method == 'undersample':
+        min_len = min(len(subdf) for subdf in dfs)
+        balanced_dfs = [
+            resample(subdf, replace=False, n_samples=min_len, random_state=42)
+            for subdf in dfs
+        ]
+    else:
+        raise ValueError("method должен быть 'oversample' или 'undersample'")
+
+    return pd.concat(balanced_dfs).sample(frac=1, random_state=42).reset_index(drop=True)
+
+
+def balance_with_interpolate(train_df, target_name='toxicity', class_balancer=None, random_state=42):
+    """
+    Балансирует обучающие данные с помощью ADASYN или SMOTE.
+    """
+    X_train, y_train = train_df.drop(columns=[target_name]), train_df[target_name]
+    balancer = class_balancer(random_state=random_state)
+    X_resampled, y_resampled = balancer.fit_resample(X_train, y_train)
+    train_df_balanced = pd.concat([X_resampled, y_resampled], axis=1)
+    return train_df_balanced
+
+
+def featurize_ecfp4(
+    mol: Chem.Mol,
+    radius: int = 2,
+    n_bits: int = 2048,
+    use_chirality: bool = False,
+    prefer_generator: bool = True
+) -> np.ndarray:
+    """
+    Generate an ECFP4 (Morgan radius=2) fingerprint for a molecule.
+
+    Parameters
+    ----------
+    mol : rdkit.Chem.rdchem.Mol
+        The molecule to featurize.
+    radius : int, optional
+        The radius for Morgan fingerprint (ECFP diameter = 2*radius).
+        Default is 2 for ECFP4.
+    n_bits : int, optional
+        Length of the bit vector. Default is 2048.
+    use_chirality : bool, optional
+        Whether to include chirality information. Default is False.
+    prefer_generator : bool, optional
+        If True, uses the new rdFingerprintGenerator API; otherwise the classic helper.
+
+    Returns
+    -------
+    np.ndarray
+        A 1D NumPy array of 0/1 ints of length `n_bits`.
+    """
+
+    # 1) generate the RDKit bitvector
+    if prefer_generator:
+        # modern generator API
+        gen = rdFingerprintGenerator.GetMorganGenerator(
+            radius=radius, fpSize=n_bits, includeChirality=use_chirality
+        )
+        bitvect = gen.GetFingerprint(mol)
+    else:
+        # classic helper function
+        bitvect = rdMolDescriptors.GetMorganFingerprintAsBitVect(
+            mol, radius=radius, nBits=n_bits, useChirality=use_chirality
+        )
+
+    # 2) convert to NumPy array
+    arr = np.zeros((n_bits,), dtype=int)
+    DataStructs.ConvertToNumpyArray(bitvect, arr)
+    return arr
+
+
+def train_test_split(
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray | None = None,
+    n_splits=5,    # для valid ≈ 1/3
+    random_state=42,
+    shuffle=True
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Возвращает train_idx, test_idx, valid_idx для трёх наборов данных,
+    стратифицированных по y и разбитых по группам groups.
+
+    - valid: выделяется первым (n_splits_outer)
+    - train/test: выделяются из оставшихся (n_splits_inner)
+    """
+    if groups is not None:
+        splitter = StratifiedGroupKFold(
+            n_splits=n_splits,
+            shuffle=shuffle,
+            random_state=random_state
+        )
+        train_idx, test_idx = next(splitter.split(X, y, groups))
+    else:
+        splitter = StratifiedKFold(
+            n_splits=n_splits,
+            shuffle=shuffle,
+            random_state=random_state
+        )
+        train_idx, test_idx = next(splitter.split(X, y))
+
+    return train_idx, test_idx
+
+
+def embeddings_dict_to_df(embeddings_dict):
+    data = []
+    for key, embedding in embeddings_dict.items():
+        data.append((key, embedding))
+    return pd.DataFrame(data, columns=['SMILES ID', 'Embedding'])
+
+
+def expand_embeddings(df: pd.DataFrame, id_col='SMILES ID', embedding_col='Embedding') -> pd.DataFrame:
+    embedding_matrix = np.stack(df[embedding_col].values)
+    component_columns = [f'Component_{i}' for i in range(embedding_matrix.shape[1])]
+    embedding_df = pd.DataFrame(embedding_matrix, columns=component_columns)
+    return pd.concat([df[[id_col]], embedding_df], axis=1)
