@@ -1,0 +1,17 @@
+name: toxicity_prediction
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11.13
+  - rdkit=2025.03.4
+  - pip
+  - pip:
+    - scikit-learn==1.7.0
+    - pandas==2.2.3
+    - shap==0.48.0
+    - jupyter==1.1.1
+    - torch==2.7.1
+    - torchvision==0.22.1
+    - torchaudio==2.7.1
+    - xgboost==3.0.2
