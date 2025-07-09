@@ -6,6 +6,96 @@ from sklearn.utils import resample
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdFingerprintGenerator, rdMolDescriptors
+import torch
+from torch import nn
+from torch.utils.data import Dataset
+from tqdm import tqdm
+from rdkit.Chem import SaltRemover, MolStandardize
+import io
+from contextlib import redirect_stderr
+
+
+def filter_and_log(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """
+    Process a DataFrame of SMILES strings, stripping salts and canonicalizing tautomers.
+    Returns a new DataFrame with valid molecules (including the original index) and a dict of per-row logs.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain columns 'SMILES' and 'toxicity'.
+
+    Returns
+    -------
+    processed_df : pd.DataFrame
+        Columns:
+          - 'orig_idx': original DataFrame index
+          - 'SMILES': cleaned canonical SMILES
+          - 'toxicity': original labels
+          - 'mol': RDKit Mol objects
+    logs : dict[int, str]
+        Mapping from original DataFrame index to captured stderr log.
+    """
+    remover = SaltRemover.SaltRemover()
+    canonicalizer = MolStandardize.rdMolStandardize.TautomerEnumerator()
+
+    log_kekulize = "Can't kekulize mol."
+    log_remove_hydrogen = "not removing hydrogen atom without neighbors"
+    log_tautomer_enumeration_stopped = "Tautomer enumeration stopped"
+
+    clean_data = {
+        'orig_idx': [],
+        'SMILES': [],
+        'toxicity': [],
+        'mol': []
+    }
+    logs = {}
+
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Filtering molecules"):
+        smi = row['SMILES']
+        label = row['toxicity']
+
+        stderr_buffer = io.StringIO()
+        with redirect_stderr(stderr_buffer):
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                stderr_buffer.write(f"[{idx}] Invalid SMILES: {smi}\n")
+            else:
+                mol = remover.StripMol(mol, dontRemoveEverything=True)
+                mol = canonicalizer.Canonicalize(mol)
+                smi_clean = Chem.MolToSmiles(mol, canonical=True)
+
+        log_text = stderr_buffer.getvalue()
+        stderr_buffer.close()
+
+        # Save log if any
+        if log_text:
+            logs[idx] = log_text
+
+        # Only keep molecules that parsed correctly and have no kekulization errors
+        if mol is not None and log_kekulize not in log_text and log_remove_hydrogen not in log_text and log_tautomer_enumeration_stopped not in log_text:
+            clean_data['orig_idx'].append(idx)
+            clean_data['SMILES'].append(smi_clean)
+            clean_data['toxicity'].append(label)
+            clean_data['mol'].append(mol)
+
+    processed_df = pd.DataFrame(clean_data)
+    processed_df = processed_df.set_index('orig_idx')
+    delta = len(processed_df) / len(df) * 100
+    print(f"Delta: {delta:.2f}%")
+    return processed_df, logs
+
+
+def is_organic(mol):
+    # Проверим, содержит ли молекула углерод
+    return any(atom.GetAtomicNum() == 6 for atom in mol.GetAtoms())
+
+
+def is_valid_organic_smiles(smi):
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return False
+    return mol.GetNumAtoms() > 1 and is_organic(mol)
 
 
 def load_embeddings_from_hdf5(file_path: str) -> dict:
@@ -186,11 +276,135 @@ def embeddings_dict_to_df(embeddings_dict):
     data = []
     for key, embedding in embeddings_dict.items():
         data.append((key, embedding))
-    return pd.DataFrame(data, columns=['SMILES ID', 'Embedding'])
+    return pd.DataFrame(data, columns=['SMILES', 'Embedding'])
 
 
-def expand_embeddings(df: pd.DataFrame, id_col='SMILES ID', embedding_col='Embedding') -> pd.DataFrame:
+def expand_embeddings(df: pd.DataFrame, id_col='SMILES', embedding_col='Embedding') -> pd.DataFrame:
     embedding_matrix = np.stack(df[embedding_col].values)
     component_columns = [f'Component_{i}' for i in range(embedding_matrix.shape[1])]
     embedding_df = pd.DataFrame(embedding_matrix, columns=component_columns)
     return pd.concat([df[[id_col]], embedding_df], axis=1)
+
+
+class BinaryDataset(Dataset):
+    def __init__(self, df, target_col='toxicity', id_col='SMILES'):
+        self.X = torch.tensor(df.drop(columns=[target_col, id_col]).values, dtype=torch.float32)
+        self.y = torch.tensor(df[target_col].values, dtype=torch.float32).unsqueeze(1)
+        self.id = df[id_col].values
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+class InferenceDataset(Dataset):
+    def __init__(self, df, target_col='toxicity', id_col='SMILES'):
+        self.X = torch.tensor(df.drop(columns=[target_col, id_col]).values, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx]
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dims=[256, 128, 64], dropout=0.3):
+        super().__init__()
+        layers = []
+        dims = [input_dim] + hidden_dims
+        for i in range(len(dims) - 1):
+            layers += [
+                nn.Linear(dims[i], dims[i+1]),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ]
+        layers.append(nn.Linear(dims[-1], 1))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, device,
+                n_epochs=50, patience=5):
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_model = None
+
+    for epoch in range(n_epochs):
+        model.train()
+        train_losses = []
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
+            train_losses.append(loss.item())
+
+        # Валидация
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                outputs = model(X_batch)
+                loss = criterion(outputs, y_batch)
+                val_losses.append(loss.item())
+
+        avg_val_loss = np.mean(val_losses)
+        print(f"[{epoch+1}] Train loss: {np.mean(train_losses):.4f}, Val loss: {avg_val_loss:.4f}")
+
+        # Early stopping
+        if avg_val_loss < best_val_loss - 1e-4:
+            best_val_loss = avg_val_loss
+            best_model = model.state_dict()
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print("Early stopping")
+                break
+
+    model.load_state_dict(best_model)
+    return model
+
+
+def evaluate(model, loader, device):
+    model.eval()
+    y_true, y_pred, y_score = [], [], []
+
+    with torch.no_grad():
+        for X_batch, y_batch in loader:
+            X_batch = X_batch.to(device)
+            logits = model(X_batch)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            preds = (probs > 0.5).astype(int)
+
+            y_score.extend(probs.flatten())
+            y_pred.extend(preds.flatten())
+            y_true.extend(y_batch.numpy().flatten())
+
+    metrics = compute_metrics(y_true, y_pred, y_score)
+    return metrics
+
+
+def predict_by_nn(model, loader, device):
+    model.eval()
+    y_pred, y_score = [], []
+
+    with torch.no_grad():
+        for X_batch in loader:
+            X_batch = X_batch.to(device)
+            logits = model(X_batch)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            preds = (probs > 0.5).astype(int)
+
+            y_score.extend(probs.flatten())
+            y_pred.extend(preds.flatten())
+
+    return pd.DataFrame({'pred': y_pred, 'score': y_score})
