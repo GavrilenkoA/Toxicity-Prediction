@@ -10,11 +10,6 @@ This project implements machine learning models to predict the toxicity of chemi
 
 ```
 toxicity_prediction/
-├── data/                   # Data files
-│   ├── tox_dataset.csv     # Original toxicity dataset
-│   ├── df_organic_cleaned.csv  # Cleaned organic molecules
-│   ├── chemberta_embeddings.pt # ChemBERTa embeddings
-│   └── output.csv          # Model predictions
 ├── notebooks/              # Jupyter notebooks
 │   ├── experiments.ipynb   # Experimental analysis
 ├── scripts/                # Python scripts
@@ -38,7 +33,7 @@ toxicity_prediction/
 
 1. **Clone the repository**:
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/GavrilenkoA/Toxicity-Prediction.git
    cd toxicity_prediction
    ```
 
